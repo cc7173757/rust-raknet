@@ -3,7 +3,8 @@ pub const RAKNET_PROTOCOL_VERSION_LIST: [u8; 2] = [10, 11];
 //the MTU is minecraft bedrock 1.18.2 give me
 pub const RAKNET_CLIENT_MTU: u16 = 1400;
 
-pub const RECEIVE_TIMEOUT: i64 = 60000;
+/// A default receive timeout milliseconds.
+pub const DEFAULT_RECEIVE_TIMEOUT: u64 = 60_000;
 
 pub enum Endian {
     Big,

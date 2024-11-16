@@ -46,6 +46,7 @@ impl RaknetSocket {
     /// Create a Raknet Socket from a UDP socket with an established Raknet connection
     ///
     /// This method is used for RaknetListener, users of the library should not care about it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn from(
         addr: &SocketAddr,
         s: &Arc<UdpSocket>,
@@ -53,6 +54,7 @@ impl RaknetSocket {
         mtu: u16,
         collecter: Arc<Mutex<Sender<SocketAddr>>>,
         raknet_version: u8,
+        receive_timeout: u64,
         proxy_protocol: bool,
     ) -> Self {
         let (user_data_sender, user_data_receiver) = channel::<Vec<u8>>(100);
@@ -75,7 +77,7 @@ impl RaknetSocket {
             proxy_protocol,
         };
         ret.start_receiver(s, receiver, user_data_sender);
-        ret.start_tick(s, Some(collecter));
+        ret.start_tick(s, Some(collecter), receive_timeout);
         ret.start_sender(s, sender_receiver);
         ret.drop_watcher().await;
         ret
@@ -218,12 +220,13 @@ impl RaknetSocket {
     }
 
     pub async fn connect_with_version(addr: &SocketAddr, raknet_version: u8) -> Result<Self> {
-        Self::connect_with(addr, raknet_version, false).await
+        Self::connect_with(addr, raknet_version, None, false).await
     }
 
     pub async fn connect_with(
         addr: &SocketAddr,
         raknet_version: u8,
+        receive_timeout: Option<u64>,
         proxy_protocol: bool,
     ) -> Result<Self> {
         let guid: u64 = rand::random();
@@ -457,7 +460,7 @@ impl RaknetSocket {
         };
 
         ret.start_receiver(&s, receiver, user_data_sender);
-        ret.start_tick(&s, None);
+        ret.start_tick(&s, None, receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT));
         ret.start_sender(&s, sender_receiver);
         ret.drop_watcher().await;
 
@@ -655,7 +658,12 @@ impl RaknetSocket {
         });
     }
 
-    fn start_tick(&self, s: &Arc<UdpSocket>, collecter: Option<Arc<Mutex<Sender<SocketAddr>>>>) {
+    fn start_tick(
+        &self,
+        s: &Arc<UdpSocket>,
+        collecter: Option<Arc<Mutex<Sender<SocketAddr>>>>,
+        receive_timeout: u64,
+    ) {
         let connected = self.close_notifier.clone();
         let s = s.clone();
         let peer_addr = self.peer_addr;
@@ -725,9 +733,9 @@ impl RaknetSocket {
                     last_monitor_tick = cur_timestamp_millis();
                 }
 
-                // if exceed 60s not received any packet will close connection.
-                if cur_timestamp_millis() - last_heartbeat_time.load(Ordering::Relaxed)
-                    > RECEIVE_TIMEOUT
+                // If no packet is received within receive_timeout milliseconds, the connection will be closed.
+                if (cur_timestamp_millis() - last_heartbeat_time.load(Ordering::Relaxed)) as u64
+                    > receive_timeout
                 {
                     raknet_log_debug!("recv timeout");
                     connected.close();
@@ -797,7 +805,7 @@ impl RaknetSocket {
     pub async fn ping_with(
         addr: &SocketAddr,
         timeout: Duration,
-        max_attempt: u32,
+        retry: u32,
         proxy_protocol: bool,
     ) -> Result<(i64, String)> {
         let s = match UdpSocket::bind("0.0.0.0:0").await {
@@ -833,7 +841,7 @@ impl RaknetSocket {
             match match tokio::time::timeout(timeout, s.recv_from(&mut buf)).await {
                 Ok(p) => p,
                 Err(_) => {
-                    if attempt >= max_attempt {
+                    if attempt > retry {
                         return Err(RaknetError::PingTimeout);
                     }
 
@@ -993,7 +1001,7 @@ impl RaknetSocket {
             return None;
         }
 
-        Some(Self::create_proxy_header(&self.local_addr, &self.peer_addr))
+        Some(Self::create_proxy_header(&self.peer_addr, &self.local_addr))
     }
 
     fn create_proxy_header<'a>(local: &SocketAddr, remote: &SocketAddr) -> ProxyHeader<'a> {

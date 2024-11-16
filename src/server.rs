@@ -31,6 +31,7 @@ pub struct RaknetListener {
     /// RakNet encryption is not supported so if it is true, it will only check cookie.
     use_encryption: bool,
     cookie_map: Arc<Mutex<HashMap<String, u32>>>,
+    receive_timeout: u64,
 }
 
 impl RaknetListener {
@@ -43,10 +44,14 @@ impl RaknetListener {
     /// let mut socket = socket = listener.accept().await.unwrap();
     /// ```
     pub async fn bind(sockaddr: &SocketAddr) -> Result<Self> {
-        Self::bind_with(sockaddr, false).await
+        Self::bind_with(sockaddr, false, None).await
     }
 
-    pub async fn bind_with(sockaddr: &SocketAddr, use_encryption: bool) -> Result<Self> {
+    pub async fn bind_with(
+        sockaddr: &SocketAddr,
+        use_encryption: bool,
+        receive_timeout: Option<u64>,
+    ) -> Result<Self> {
         let s = match UdpSocket::bind(sockaddr).await {
             Ok(p) => p,
             Err(_) => {
@@ -70,6 +75,7 @@ impl RaknetListener {
             version_map: Arc::new(Mutex::new(HashMap::new())),
             use_encryption,
             cookie_map: Arc::new(Mutex::new(HashMap::new())),
+            receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
         };
 
         ret.drop_watcher().await;
@@ -83,7 +89,11 @@ impl RaknetListener {
     /// let raw_socket = std::net::UdpSocket::bind("127.0.0.1:19132").unwrap();
     /// let listener = RaknetListener::from_std(raw_socket);
     /// ```
-    pub async fn from_std(s: std::net::UdpSocket, use_encryption: bool) -> Result<Self> {
+    pub async fn from_std(
+        s: std::net::UdpSocket,
+        use_encryption: bool,
+        receive_timeout: Option<u64>,
+    ) -> Result<Self> {
         s.set_nonblocking(true)
             .expect("set udpsocket nonblocking error");
 
@@ -110,6 +120,7 @@ impl RaknetListener {
             version_map: Arc::new(Mutex::new(HashMap::new())),
             use_encryption,
             cookie_map: Arc::new(Mutex::new(HashMap::new())),
+            receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
         };
 
         ret.drop_watcher().await;
@@ -252,6 +263,7 @@ impl RaknetListener {
         let version_map = self.version_map.clone();
         let use_encryption = self.use_encryption;
         let cookie_map = self.cookie_map.clone();
+        let receive_timeout = self.receive_timeout;
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
 
@@ -504,6 +516,7 @@ impl RaknetListener {
                             req.mtu,
                             collect_sender.clone(),
                             raknet_version,
+                            receive_timeout,
                             false,
                         )
                         .await;
