@@ -220,14 +220,14 @@ impl RaknetSocket {
     }
 
     pub async fn connect_with_version(addr: &SocketAddr, raknet_version: u8) -> Result<Self> {
-        Self::connect_with(addr, raknet_version, None, false).await
+        Self::connect_with(addr, raknet_version, None, None).await
     }
 
     pub async fn connect_with(
         addr: &SocketAddr,
         raknet_version: u8,
         receive_timeout: Option<u64>,
-        proxy_protocol: bool,
+        proxy_protocol_client_address: Option<&SocketAddr>,
     ) -> Result<Self> {
         let guid: u64 = rand::random();
 
@@ -236,11 +236,8 @@ impl RaknetSocket {
             Err(_) => return Err(RaknetError::BindAddressError),
         };
 
-        let proxy_protocol_header = if proxy_protocol {
-            Some(Self::create_proxy_header(&s.local_addr().unwrap(), addr))
-        } else {
-            None
-        };
+        let proxy_protocol_header = proxy_protocol_client_address
+            .map(|client| Self::create_proxy_header(client, &s.local_addr().unwrap()));
 
         let packet = OpenConnectionRequest1 {
             magic: true,
@@ -456,7 +453,7 @@ impl RaknetSocket {
             sender: sender_sender,
             drop_notifier: Arc::new(Notify::new()),
             raknet_version,
-            proxy_protocol,
+            proxy_protocol: proxy_protocol_header.is_some(),
         };
 
         ret.start_receiver(&s, receiver, user_data_sender);
@@ -1004,8 +1001,8 @@ impl RaknetSocket {
         Some(Self::create_proxy_header(&self.peer_addr, &self.local_addr))
     }
 
-    fn create_proxy_header<'a>(local: &SocketAddr, remote: &SocketAddr) -> ProxyHeader<'a> {
-        let address = ProxiedAddress::datagram(*local, *remote);
+    fn create_proxy_header<'a>(client: &SocketAddr, local: &SocketAddr) -> ProxyHeader<'a> {
+        let address = ProxiedAddress::datagram(*client, *local);
         ProxyHeader::with_address(address)
     }
 
