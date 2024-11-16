@@ -105,6 +105,7 @@ pub struct ConnectedPing {
 #[derive(Clone)]
 pub struct PacketUnconnectedPing {
     pub time: i64,
+    #[expect(unused)]
     pub magic: bool,
     pub guid: u64,
 }
@@ -113,6 +114,7 @@ pub struct PacketUnconnectedPing {
 pub struct PacketUnconnectedPong {
     pub time: i64,
     pub guid: u64,
+    #[expect(unused)]
     pub magic: bool,
     pub motd: String,
 }
@@ -125,6 +127,7 @@ pub struct ConnectedPong {
 
 #[derive(Clone)]
 pub struct OpenConnectionRequest1 {
+    #[expect(unused)]
     pub magic: bool,
     pub protocol_version: u8,
     pub mtu_size: u16,
@@ -132,7 +135,12 @@ pub struct OpenConnectionRequest1 {
 
 #[derive(Clone)]
 pub struct OpenConnectionRequest2 {
+    #[expect(unused)]
     pub magic: bool,
+    /// Only present if a cookie is provided in [`OpenConnectionReply1`].
+    pub cookie: Option<u32>,
+    /// Only present if a cookie is provided in [`OpenConnectionReply1`].
+    pub support_encryption: Option<u8>,
     pub address: std::net::SocketAddr,
     pub mtu: u16,
     pub guid: u64,
@@ -140,14 +148,20 @@ pub struct OpenConnectionRequest2 {
 
 #[derive(Clone)]
 pub struct OpenConnectionReply1 {
+    #[expect(unused)]
     pub magic: bool,
     pub guid: u64,
     pub use_encryption: u8,
+    /// If `use_encryption` is true, the cookie is provided.
+    /// The cookie must be provided in [`OpenConnectionRequest2`]
+    /// even the encryption is not supported by the client.
+    pub cookie: Option<u32>,
     pub mtu_size: u16,
 }
 
 #[derive(Clone)]
 pub struct OpenConnectionReply2 {
+    #[expect(unused)]
     pub magic: bool,
     pub guid: u64,
     pub address: std::net::SocketAddr,
@@ -180,12 +194,14 @@ pub struct NewIncomingConnection {
 #[derive(Clone)]
 pub struct IncompatibleProtocolVersion {
     pub server_protocol: u8,
+    #[expect(unused)]
     pub magic: bool,
     pub server_guid: u64,
 }
 
 #[derive(Clone)]
 pub struct AlreadyConnected {
+    #[expect(unused)]
     pub magic: bool,
     pub guid: u64,
 }
@@ -265,11 +281,24 @@ pub fn write_packet_connection_open_request_1(packet: &OpenConnectionRequest1) -
     Ok(cursor.get_raw_payload())
 }
 
-pub fn read_packet_connection_open_request_2(buf: &[u8]) -> Result<OpenConnectionRequest2> {
+pub fn read_packet_connection_open_request_2(
+    buf: &[u8],
+    server_encryption_enabled: bool,
+) -> Result<OpenConnectionRequest2> {
     let mut cursor = RaknetReader::new(buf.to_vec());
     unwrap_or_return!(cursor.read_u8());
     Ok(OpenConnectionRequest2 {
         magic: unwrap_or_return!(cursor.read_magic()),
+        cookie: if server_encryption_enabled {
+            Some(unwrap_or_return!(cursor.read_u32(Endian::Little)))
+        } else {
+            None
+        },
+        support_encryption: if server_encryption_enabled {
+            Some(unwrap_or_return!(cursor.read_u8()))
+        } else {
+            None
+        },
         address: unwrap_or_return!(cursor.read_address()),
         mtu: unwrap_or_return!(cursor.read_u16(Endian::Big)),
         guid: unwrap_or_return!(cursor.read_u64(Endian::Big)),
@@ -280,6 +309,13 @@ pub fn write_packet_connection_open_request_2(packet: &OpenConnectionRequest2) -
     let mut cursor = RaknetWriter::new();
     unwrap_or_return!(cursor.write_u8(PacketID::OpenConnectionRequest2.to_u8()));
     unwrap_or_return!(cursor.write_magic());
+    if let Some(support_encryption) = packet.support_encryption {
+        unwrap_or_return!(cursor.write_u32(
+            packet.cookie.ok_or(RaknetError::PacketParseError)?,
+            Endian::Little
+        ));
+        unwrap_or_return!(cursor.write_u8(support_encryption));
+    }
     unwrap_or_return!(cursor.write_address(packet.address));
     unwrap_or_return!(cursor.write_u16(packet.mtu, Endian::Big));
     unwrap_or_return!(cursor.write_u64(packet.guid, Endian::Big));
@@ -289,11 +325,21 @@ pub fn write_packet_connection_open_request_2(packet: &OpenConnectionRequest2) -
 
 pub fn read_packet_connection_open_reply_1(buf: &[u8]) -> Result<OpenConnectionReply1> {
     let mut cursor = RaknetReader::new(buf.to_vec());
+
     unwrap_or_return!(cursor.read_u8());
+    let magic = unwrap_or_return!(cursor.read_magic());
+    let guid = unwrap_or_return!(cursor.read_u64(Endian::Big));
+    let use_encryption = unwrap_or_return!(cursor.read_u8());
+
     Ok(OpenConnectionReply1 {
-        magic: unwrap_or_return!(cursor.read_magic()),
-        guid: unwrap_or_return!(cursor.read_u64(Endian::Big)),
-        use_encryption: unwrap_or_return!(cursor.read_u8()),
+        magic,
+        guid,
+        use_encryption,
+        cookie: if use_encryption != 0x00 {
+            Some(unwrap_or_return!(cursor.read_u32(Endian::Little)))
+        } else {
+            None
+        },
         mtu_size: unwrap_or_return!(cursor.read_u16(Endian::Big)),
     })
 }
@@ -304,6 +350,12 @@ pub fn write_packet_connection_open_reply_1(packet: &OpenConnectionReply1) -> Re
     unwrap_or_return!(cursor.write_magic());
     unwrap_or_return!(cursor.write_u64(packet.guid, Endian::Big));
     unwrap_or_return!(cursor.write_u8(packet.use_encryption));
+    if packet.use_encryption != 0x00 {
+        unwrap_or_return!(cursor.write_u32(
+            packet.cookie.ok_or(RaknetError::PacketParseError)?,
+            Endian::Little
+        ));
+    }
     unwrap_or_return!(cursor.write_u16(packet.mtu_size, Endian::Big));
 
     Ok(cursor.get_raw_payload())
@@ -457,7 +509,7 @@ pub fn write_packet_ack(packet: &Ack) -> Result<Vec<u8>> {
             } else {
                 0u8
             };
-        unwrap_or_return!(cursor.write_u8(single_sequence_number as u8));
+        unwrap_or_return!(cursor.write_u8(single_sequence_number));
         unwrap_or_return!(cursor.write_u24(packet.sequences[i as usize].0, Endian::Little));
         if single_sequence_number == 0x00 {
             unwrap_or_return!(cursor.write_u24(packet.sequences[i as usize].1, Endian::Little));

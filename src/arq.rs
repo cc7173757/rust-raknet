@@ -53,6 +53,7 @@ const CONTINUOUS_SEND_FLAG: u8 = 0x8;
 
 #[derive(Clone)]
 pub struct FrameSetPacket {
+    #[allow(unused)]
     pub id: u8,
     pub sequence_number: u32,
     pub flags: u8,
@@ -665,11 +666,11 @@ impl SendQ {
                     }
 
                     for i in 0..compound_size {
-                        let begin = (max * i) as usize;
+                        let begin = max * i;
                         let end = if i == compound_size - 1 {
                             buf.len()
                         } else {
-                            (max * (i + 1)) as usize
+                            max * (i + 1)
                         };
 
                         let mut frame =

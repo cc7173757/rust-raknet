@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::error::{RaknetError, Result};
 use crate::packet::*;
@@ -17,7 +17,7 @@ type SessionSender = (i64, Sender<Vec<u8>>);
 
 /// Implementation of Raknet Server.
 pub struct RaknetListener {
-    motd: String,
+    motd: Arc<RwLock<String>>,
     socket: Option<Arc<UdpSocket>>,
     guid: u64,
     listened: bool,
@@ -28,6 +28,9 @@ pub struct RaknetListener {
     all_session_closed_notifier: Arc<Notify>,
     drop_notifier: Arc<Notify>,
     version_map: Arc<Mutex<HashMap<String, u8>>>,
+    /// RakNet encryption is not supported so if it is true, it will only check cookie.
+    use_encryption: bool,
+    cookie_map: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl RaknetListener {
@@ -40,17 +43,21 @@ impl RaknetListener {
     /// let mut socket = socket = listener.accept().await.unwrap();
     /// ```
     pub async fn bind(sockaddr: &SocketAddr) -> Result<Self> {
+        Self::bind_with(sockaddr, false).await
+    }
+
+    pub async fn bind_with(sockaddr: &SocketAddr, use_encryption: bool) -> Result<Self> {
         let s = match UdpSocket::bind(sockaddr).await {
             Ok(p) => p,
             Err(_) => {
-                return Err(RaknetError::BindAdressError);
+                return Err(RaknetError::BindAddressError);
             }
         };
 
         let (connection_sender, connection_receiver) = channel::<RaknetSocket>(10);
 
         let ret = Self {
-            motd: String::new(),
+            motd: Arc::new(RwLock::new(String::new())),
             socket: Some(Arc::new(s)),
             guid: rand::random(),
             listened: false,
@@ -61,6 +68,8 @@ impl RaknetListener {
             all_session_closed_notifier: Arc::new(Notify::new()),
             drop_notifier: Arc::new(Notify::new()),
             version_map: Arc::new(Mutex::new(HashMap::new())),
+            use_encryption,
+            cookie_map: Arc::new(Mutex::new(HashMap::new())),
         };
 
         ret.drop_watcher().await;
@@ -74,7 +83,7 @@ impl RaknetListener {
     /// let raw_socket = std::net::UdpSocket::bind("127.0.0.1:19132").unwrap();
     /// let listener = RaknetListener::from_std(raw_socket);
     /// ```
-    pub async fn from_std(s: std::net::UdpSocket) -> Result<Self> {
+    pub async fn from_std(s: std::net::UdpSocket, use_encryption: bool) -> Result<Self> {
         s.set_nonblocking(true)
             .expect("set udpsocket nonblocking error");
 
@@ -88,7 +97,7 @@ impl RaknetListener {
         let (connection_sender, connection_receiver) = channel::<RaknetSocket>(10);
 
         let ret = Self {
-            motd: String::new(),
+            motd: Arc::new(RwLock::new(String::new())),
             socket: Some(Arc::new(s)),
             guid: rand::random(),
             listened: false,
@@ -99,6 +108,8 @@ impl RaknetListener {
             all_session_closed_notifier: Arc::new(Notify::new()),
             drop_notifier: Arc::new(Notify::new()),
             version_map: Arc::new(Mutex::new(HashMap::new())),
+            use_encryption,
+            cookie_map: Arc::new(Mutex::new(HashMap::new())),
         };
 
         ret.drop_watcher().await;
@@ -151,12 +162,7 @@ impl RaknetListener {
             let mut sessions = sessions.lock().await;
 
             for i in sessions.iter() {
-                if i.1
-                     .1
-                    .send(vec![PacketID::Disconnect.to_u8()])
-                    .await
-                    .is_ok()
-                {}
+                i.1 .1.send(vec![PacketID::Disconnect.to_u8()]).await.ok();
 
                 match socket.send_to(&[PacketID::Disconnect.to_u8()], i.0).await {
                     Ok(_) => {}
@@ -208,14 +214,22 @@ impl RaknetListener {
             return;
         }
 
-        if self.motd.is_empty() {
+        if self.get_motd().await.is_empty() {
+            let port = self.socket.as_ref().unwrap().local_addr().unwrap().port();
+
             self.set_motd(
+                "MCPE",
                 SERVER_NAME,
+                748,
+                "1.21.40",
+                0,
                 MAX_CONNECTION,
-                "486",
-                "1.18.11",
+                None,
+                "rust-raknet",
                 "Survival",
-                self.socket.as_ref().unwrap().local_addr().unwrap().port(),
+                true,
+                port,
+                port,
             )
             .await;
         }
@@ -224,7 +238,7 @@ impl RaknetListener {
         let guid = self.guid;
         let sessions = self.sessions.clone();
         let connection_sender = self.connection_sender.clone();
-        let motd = self.get_motd().await;
+        let motd = self.motd.clone();
 
         self.listened = true;
 
@@ -236,6 +250,8 @@ impl RaknetListener {
         let local_addr = socket.local_addr().unwrap();
         let close_notify = self.close_notifier.clone();
         let version_map = self.version_map.clone();
+        let use_encryption = self.use_encryption;
+        let cookie_map = self.cookie_map.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
 
@@ -279,6 +295,7 @@ impl RaknetListener {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
+                        let motd = { (*motd.read().await).clone() };
 
                         let packet = crate::packet::PacketUnconnectedPong {
                             time: cur_timestamp_millis(),
@@ -305,6 +322,7 @@ impl RaknetListener {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
+                        let motd = { (*motd.read().await).clone() };
 
                         let packet = crate::packet::PacketUnconnectedPong {
                             time: cur_timestamp_millis(),
@@ -356,11 +374,26 @@ impl RaknetListener {
                             version_map.insert(addr.to_string(), req.protocol_version);
                         }
 
+                        // A random cookie to prevent IP spoofing.
+                        let cookie = if use_encryption {
+                            let cookie = rand::random();
+
+                            {
+                                let mut cookie_map = cookie_map.lock().await;
+                                cookie_map.insert(addr.to_string(), cookie);
+                            }
+
+                            Some(cookie)
+                        } else {
+                            None
+                        };
+
                         let packet = crate::packet::OpenConnectionReply1 {
                             magic: true,
                             guid,
                             // Make sure this is false, it is vital for the login sequence to continue
-                            use_encryption: 0x00,
+                            use_encryption: if use_encryption { 0x01 } else { 0x00 },
+                            cookie,
                             // see Open Connection Request 1
                             mtu_size: RAKNET_CLIENT_MTU,
                         };
@@ -379,10 +412,41 @@ impl RaknetListener {
                         continue;
                     }
                     PacketID::OpenConnectionRequest2 => {
-                        let req = match read_packet_connection_open_request_2(&buf[..size]) {
+                        let req = match read_packet_connection_open_request_2(
+                            &buf[..size],
+                            use_encryption,
+                        ) {
                             Ok(p) => p,
-                            Err(_) => continue,
+                            Err(err) => {
+                                raknet_log_error!("Oh: {:?}", err);
+                                continue;
+                            }
                         };
+
+                        // If the server enabled RakNet encryption, check the cookie is valid.
+                        if use_encryption {
+                            let cookie = match req.cookie {
+                                Some(cookie) => cookie,
+                                None => {
+                                    raknet_log_debug!("cookie must be provided");
+                                    continue;
+                                }
+                            };
+                            if req.support_encryption != Some(0x00) {
+                                raknet_log_error!("RakNet encryption is not supported");
+                                continue;
+                            }
+
+                            let saved_cookie = {
+                                let cookie_map = cookie_map.lock().await;
+                                cookie_map.get(&addr.to_string()).cloned()
+                            };
+
+                            if saved_cookie != Some(cookie) {
+                                raknet_log_error!("the provided cookie is incorrect");
+                                continue;
+                            }
+                        }
 
                         let packet = crate::packet::OpenConnectionReply2 {
                             magic: true,
@@ -440,6 +504,7 @@ impl RaknetListener {
                             req.mtu,
                             collect_sender.clone(),
                             raknet_version,
+                            false,
                         )
                         .await;
 
@@ -452,6 +517,12 @@ impl RaknetListener {
                         if sessions.contains_key(&addr) {
                             sessions[&addr].1.send(buf[..size].to_vec()).await.unwrap();
                             sessions.remove(&addr);
+
+                            // Remove the cookie if it is disconnected.
+                            {
+                                let mut cookie_map = cookie_map.lock().await;
+                                cookie_map.remove(&addr.to_string());
+                            }
                         }
                     }
                     _ => {
@@ -461,6 +532,13 @@ impl RaknetListener {
                                 Ok(_) => {}
                                 Err(_) => {
                                     sessions.remove(&addr);
+
+                                    // Remove the cookie if it is disconnected.
+                                    {
+                                        let mut cookie_map = cookie_map.lock().await;
+                                        cookie_map.remove(&addr.to_string());
+                                    }
+
                                     continue;
                                 }
                             };
@@ -511,26 +589,39 @@ impl RaknetListener {
     /// # Example
     /// ```ignore
     /// let mut listener = RaknetListener::bind("127.0.0.1:19132".parse().unwrap()).await.unwrap();
-    /// listener.set_motd("Another Minecraft Server" , 999999 , "486" , "1.18.11", "Survival" , 19132).await;
+    /// listener.set_motd("MCPE", "Another Minecraft Server", 748, "1.21.40", 3, 10, None, "Bedrock Level", "Survival", true, 19132, 19132).await;
     /// ```
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_motd(
         &mut self,
-        server_name: &str,
-        max_connection: u32,
-        mc_protocol_version: &str,
+        edition: &str,
+        motd: &str,
+        mc_protocol_version: i32,
         mc_version: &str,
+        player_count: u32,
+        max_player_count: u32,
+        server_id: Option<u64>,
+        sub_motd: &str,
         game_type: &str,
-        port: u16,
+        nintendo_allowed: bool,
+        ipv4_port: u16,
+        ipv6_port: u16,
     ) {
-        self.motd = format!(
-            "MCPE;{};{};{};0;{};{};Bedrock level;{};1;{};",
-            server_name,
+        let mut m = self.motd.write().await;
+        *m = format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{};",
+            edition,
+            motd,
             mc_protocol_version,
             mc_version,
-            max_connection,
-            self.guid,
+            player_count,
+            max_player_count,
+            server_id.unwrap_or(self.guid),
+            sub_motd,
             game_type,
-            port
+            if nintendo_allowed { "1" } else { "0" },
+            ipv4_port,
+            ipv6_port
         );
     }
 
@@ -542,6 +633,10 @@ impl RaknetListener {
     /// let motd = listener.get_motd().await;
     /// ```
     pub async fn get_motd(&self) -> String {
+        self.motd.read().await.clone()
+    }
+
+    pub async fn motd(&self) -> Arc<RwLock<String>> {
         self.motd.clone()
     }
 
@@ -589,8 +684,9 @@ impl RaknetListener {
     /// let mut socket = RaknetListener::bind("127.0.0.1:19132".parse().unwrap()).await.unwrap();
     /// socket.set_full_motd("motd").await;
     /// ```
-    pub fn set_full_motd(&mut self, motd: String) -> Result<()> {
-        self.motd = motd;
+    pub async fn set_full_motd(&mut self, motd: String) -> Result<()> {
+        let mut m = self.motd.write().await;
+        *m = motd;
         Ok(())
     }
 
@@ -598,6 +694,16 @@ impl RaknetListener {
         let version_map = self.version_map.lock().await;
         let ver = version_map.get(&peer.to_string());
         Ok(*ver.unwrap_or(&RAKNET_PROTOCOL_VERSION))
+    }
+
+    pub async fn get_peer_cookie(&self, peer: &SocketAddr) -> Result<Option<u32>> {
+        let cookie_map = self.cookie_map.lock().await;
+        let cookie = cookie_map.get(&peer.to_string()).cloned();
+        Ok(cookie)
+    }
+
+    pub fn guid(&self) -> u64 {
+        self.guid
     }
 
     async fn drop_watcher(&self) {

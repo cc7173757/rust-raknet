@@ -1,3 +1,4 @@
+use proxy_header::{ProxiedAddress, ProxyHeader};
 use rand::Rng;
 use std::{
     net::SocketAddr,
@@ -5,6 +6,7 @@ use std::{
         atomic::{AtomicI64, AtomicU8},
         Arc,
     },
+    time::Duration,
 };
 use tokio::{
     net::UdpSocket,
@@ -36,6 +38,8 @@ pub struct RaknetSocket {
     sender: Sender<(Vec<u8>, SocketAddr, bool, u8)>,
     drop_notifier: Arc<Notify>,
     raknet_version: u8,
+    /// If it is enabled, only the first packet of the connection will include the PROXY protocol V2 header.
+    proxy_protocol: bool,
 }
 
 impl RaknetSocket {
@@ -49,6 +53,7 @@ impl RaknetSocket {
         mtu: u16,
         collecter: Arc<Mutex<Sender<SocketAddr>>>,
         raknet_version: u8,
+        proxy_protocol: bool,
     ) -> Self {
         let (user_data_sender, user_data_receiver) = channel::<Vec<u8>>(100);
         let (sender_sender, sender_receiver) = channel::<(Vec<u8>, SocketAddr, bool, u8)>(10);
@@ -67,6 +72,7 @@ impl RaknetSocket {
             sender: sender_sender,
             drop_notifier: Arc::new(Notify::new()),
             raknet_version,
+            proxy_protocol,
         };
         ret.start_receiver(s, receiver, user_data_sender);
         ret.start_tick(s, Some(collecter));
@@ -98,7 +104,8 @@ impl RaknetSocket {
                 sendq
                     .write()
                     .await
-                    .insert(Reliability::ReliableOrdered, &buf)?;
+                    // Send as Unreliable because this packet can be abused with modified NACK.
+                    .insert(Reliability::Unreliable, &buf)?;
             }
             PacketID::ConnectionRequestAccepted => {
                 let packet = read_packet_connection_request_accepted(frame.data.as_slice())?;
@@ -154,12 +161,13 @@ impl RaknetSocket {
         Ok(true)
     }
 
-    async fn sendto(
+    async fn sendto<'a>(
         s: &UdpSocket,
         buf: &[u8],
         target: &SocketAddr,
         enable_loss: bool,
         loss_rate: u8,
+        proxy_protocol_header: &Option<ProxyHeader<'a>>,
     ) -> tokio::io::Result<usize> {
         if enable_loss {
             let mut rng = rand::thread_rng();
@@ -169,7 +177,22 @@ impl RaknetSocket {
                 return Ok(0);
             }
         }
-        match s.send_to(buf, target).await {
+
+        let size = if let Some(proxy_protocol_header) = proxy_protocol_header {
+            let mut new_buf = Vec::with_capacity(30);
+
+            proxy_protocol_header
+                .encode_v2(&mut new_buf)
+                .map_err(|_| tokio::io::ErrorKind::InvalidData)?;
+
+            new_buf.extend_from_slice(buf);
+
+            s.send_to(&new_buf, target).await
+        } else {
+            s.send_to(buf, target).await
+        };
+
+        match size {
             Ok(p) => Ok(p),
             Err(e) => {
                 raknet_log_error!("udp socket send_to error : {}", e);
@@ -195,11 +218,25 @@ impl RaknetSocket {
     }
 
     pub async fn connect_with_version(addr: &SocketAddr, raknet_version: u8) -> Result<Self> {
+        Self::connect_with(addr, raknet_version, false).await
+    }
+
+    pub async fn connect_with(
+        addr: &SocketAddr,
+        raknet_version: u8,
+        proxy_protocol: bool,
+    ) -> Result<Self> {
         let guid: u64 = rand::random();
 
         let s = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(p) => p,
-            Err(_) => return Err(RaknetError::BindAdressError),
+            Err(_) => return Err(RaknetError::BindAddressError),
+        };
+
+        let proxy_protocol_header = if proxy_protocol {
+            Some(Self::create_proxy_header(&s.local_addr().unwrap(), addr))
+        } else {
+            None
         };
 
         let packet = OpenConnectionRequest1 {
@@ -216,7 +253,7 @@ impl RaknetSocket {
         let mut reply1_buf = [0u8; 2048];
 
         loop {
-            match s.send_to(&buf, addr).await {
+            match Self::sendto(&s, &buf, addr, false, 0, &proxy_protocol_header).await {
                 Ok(p) => p,
                 Err(e) => {
                     raknet_log_error!("udp socket sendto error {}", e);
@@ -268,8 +305,21 @@ impl RaknetSocket {
             Err(_) => return Err(RaknetError::PacketParseError),
         };
 
+        // If the server reply with encryption enabled, next request must contains the cookie from it.
+        // However, RakNet encryption is not supported by this library, so set support_encryption to false.
+        let (cookie, support_encryption) = if reply1.use_encryption != 0x00 {
+            let cookie = reply1.cookie.ok_or(RaknetError::PacketParseError)?;
+
+            raknet_log_debug!("reply1 contains cookie: {}", cookie);
+            (Some(cookie), Some(0x00))
+        } else {
+            (None, None)
+        };
+
         let packet = OpenConnectionRequest2 {
             magic: true,
+            cookie,
+            support_encryption,
             address: remote_addr,
             mtu: reply1.mtu_size,
             guid,
@@ -403,6 +453,7 @@ impl RaknetSocket {
             sender: sender_sender,
             drop_notifier: Arc::new(Notify::new()),
             raknet_version,
+            proxy_protocol,
         };
 
         ret.start_receiver(&s, receiver, user_data_sender);
@@ -552,6 +603,7 @@ impl RaknetSocket {
                             &peer_addr,
                             enable_loss.load(Ordering::Relaxed),
                             loss_rate.load(Ordering::Relaxed),
+                            &None,
                         )
                         .await
                         .unwrap();
@@ -578,7 +630,7 @@ impl RaknetSocket {
                     a = receiver.recv() => {
                         match a {
                             Some(p) => {
-                                match RaknetSocket::sendto(&s, &p.0, &p.1, p.2, p.3).await{
+                                match RaknetSocket::sendto(&s, &p.0, &p.1, p.2, p.3, &None).await{
                                     Ok(_) => {},
                                     Err(e) => {
                                         raknet_log_debug!("sendto error : {}" , e);
@@ -636,6 +688,7 @@ impl RaknetSocket {
                         &peer_addr,
                         enable_loss.load(Ordering::Relaxed),
                         loss_rate.load(Ordering::Relaxed),
+                        &None,
                     )
                     .await
                     .unwrap();
@@ -651,6 +704,7 @@ impl RaknetSocket {
                         &peer_addr,
                         enable_loss.load(Ordering::Relaxed),
                         loss_rate.load(Ordering::Relaxed),
+                        &None,
                     )
                     .await
                     .unwrap();
@@ -688,6 +742,7 @@ impl RaknetSocket {
                             &peer_addr,
                             enable_loss.load(Ordering::Relaxed),
                             loss_rate.load(Ordering::Relaxed),
+                            &None,
                         )
                         .await
                         .unwrap();
@@ -696,16 +751,13 @@ impl RaknetSocket {
                 }
             }
 
-            match collecter {
-                Some(p) => {
-                    match p.lock().await.send(peer_addr).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            raknet_log_error!("channel send error : {}", e);
-                        }
-                    };
-                }
-                None => {}
+            if let Some(p) = collecter {
+                match p.lock().await.send(peer_addr).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        raknet_log_error!("channel send error : {}", e);
+                    }
+                };
             }
             raknet_log_debug!("{} , ticker finished", peer_addr);
         });
@@ -739,11 +791,26 @@ impl RaknetSocket {
     /// assert!((0..10).contains(&latency));
     /// ```
     pub async fn ping(addr: &SocketAddr) -> Result<(i64, String)> {
+        Self::ping_with(addr, Duration::from_secs(5), 3, false).await
+    }
+
+    pub async fn ping_with(
+        addr: &SocketAddr,
+        timeout: Duration,
+        max_attempt: u32,
+        proxy_protocol: bool,
+    ) -> Result<(i64, String)> {
         let s = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(p) => p,
-            Err(_) => return Err(RaknetError::BindAdressError),
+            Err(_) => return Err(RaknetError::BindAddressError),
+        };
+        let proxy_protocol_header = if proxy_protocol {
+            Some(Self::create_proxy_header(&s.local_addr().unwrap(), addr))
+        } else {
+            None
         };
 
+        let mut attempt = 1u32;
         loop {
             let packet = PacketUnconnectedPing {
                 time: cur_timestamp_millis(),
@@ -753,7 +820,7 @@ impl RaknetSocket {
 
             let buf = write_packet_ping(&packet)?;
 
-            match s.send_to(buf.as_slice(), addr).await {
+            match Self::sendto(&s, buf.as_slice(), addr, false, 0, &proxy_protocol_header).await {
                 Ok(_) => {}
                 Err(e) => {
                     raknet_log_error!("udp socket sendto error {}", e);
@@ -763,14 +830,14 @@ impl RaknetSocket {
 
             let mut buf = [0u8; 1024];
 
-            match match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                s.recv_from(&mut buf),
-            )
-            .await
-            {
+            match match tokio::time::timeout(timeout, s.recv_from(&mut buf)).await {
                 Ok(p) => p,
                 Err(_) => {
+                    if attempt >= max_attempt {
+                        return Err(RaknetError::PingTimeout);
+                    }
+
+                    attempt += 1;
                     continue;
                 }
             } {
@@ -901,6 +968,11 @@ impl RaknetSocket {
         Ok(self.raknet_version)
     }
 
+    /// Check the connection is closed.
+    pub fn is_closed(&self) -> bool {
+        self.close_notifier.is_closed()
+    }
+
     /// Set the packet loss rate and use it for testing
     ///
     /// The `stage` parameter ranges from 0 to 10, indicating a packet loss rate of 0% to 100%.
@@ -913,6 +985,20 @@ impl RaknetSocket {
     pub fn set_loss_rate(&mut self, stage: u8) {
         self.enable_loss.store(true, Ordering::Relaxed);
         self.loss_rate.store(stage, Ordering::Relaxed);
+    }
+
+    /// Get the PROXY Protocol header for this socket.
+    pub fn get_proxy_header<'a>(&self) -> Option<ProxyHeader<'a>> {
+        if !self.proxy_protocol {
+            return None;
+        }
+
+        Some(Self::create_proxy_header(&self.local_addr, &self.peer_addr))
+    }
+
+    fn create_proxy_header<'a>(local: &SocketAddr, remote: &SocketAddr) -> ProxyHeader<'a> {
+        let address = ProxiedAddress::datagram(*local, *remote);
+        ProxyHeader::with_address(address)
     }
 
     async fn drop_watcher(&self) {
