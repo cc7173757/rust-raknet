@@ -15,6 +15,8 @@ const MAX_CONNECTION: u32 = 99999;
 
 type SessionSender = (i64, Sender<Vec<u8>>);
 
+type QueryPacket = (SocketAddr, Vec<u8>);
+
 /// Implementation of Raknet Server.
 pub struct RaknetListener {
     motd: Arc<RwLock<String>>,
@@ -32,6 +34,8 @@ pub struct RaknetListener {
     use_encryption: bool,
     cookie_map: Arc<Mutex<HashMap<String, u32>>>,
     receive_timeout: u64,
+    query_sender: Sender<QueryPacket>,
+    query_receiver: Arc<Mutex<Receiver<QueryPacket>>>,
 }
 
 impl RaknetListener {
@@ -61,6 +65,8 @@ impl RaknetListener {
 
         let (connection_sender, connection_receiver) = channel::<RaknetSocket>(10);
 
+        let (query_sender, query_receiver) = channel::<QueryPacket>(10);
+
         let ret = Self {
             motd: Arc::new(RwLock::new(String::new())),
             socket: Some(Arc::new(s)),
@@ -76,6 +82,8 @@ impl RaknetListener {
             use_encryption,
             cookie_map: Arc::new(Mutex::new(HashMap::new())),
             receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
+            query_sender,
+            query_receiver: Arc::new(Mutex::new(query_receiver)),
         };
 
         ret.drop_watcher().await;
@@ -106,6 +114,8 @@ impl RaknetListener {
 
         let (connection_sender, connection_receiver) = channel::<RaknetSocket>(10);
 
+        let (query_sender, query_receiver) = channel::<QueryPacket>(10);
+
         let ret = Self {
             motd: Arc::new(RwLock::new(String::new())),
             socket: Some(Arc::new(s)),
@@ -121,6 +131,8 @@ impl RaknetListener {
             use_encryption,
             cookie_map: Arc::new(Mutex::new(HashMap::new())),
             receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
+            query_sender,
+            query_receiver: Arc::new(Mutex::new(query_receiver)),
         };
 
         ret.drop_watcher().await;
@@ -264,6 +276,7 @@ impl RaknetListener {
         let use_encryption = self.use_encryption;
         let cookie_map = self.cookie_map.clone();
         let receive_timeout = self.receive_timeout;
+        let query_sender = self.query_sender.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
 
@@ -293,10 +306,17 @@ impl RaknetListener {
                     }
                 }
 
+                // Check if it is Query Protocol.
+                if buf[0] == 0xFE && buf[1] == 0xFD {
+                    raknet_log_debug!("received a Query Protocol packet");
+                    query_sender.send((addr, buf.to_vec())).await.ok();
+                    continue;
+                }
+
                 let cur_status = match PacketID::from(buf[0]) {
                     Ok(p) => p,
                     Err(e) => {
-                        raknet_log_debug!("parse packetid faild : {:?}", e);
+                        raknet_log_debug!("parse PacketID failed : {:?}", e);
                         continue;
                     }
                 };
@@ -576,21 +596,21 @@ impl RaknetListener {
     /// ```
     pub async fn accept(&mut self) -> Result<RaknetSocket> {
         if !self.listened {
-            Err(RaknetError::NotListen)
-        } else {
-            tokio::select! {
-                a = self.connection_receiver.recv() => {
-                    match a {
-                        Some(p) => Ok(p),
-                        None => {
-                            Err(RaknetError::NotListen)
-                        },
-                    }
-                },
-                _ = self.close_notifier.acquire() => {
-                    raknet_log_debug!("accept close notified");
-                    Err(RaknetError::NotListen)
+            return Err(RaknetError::NotListen);
+        }
+
+        tokio::select! {
+            a = self.connection_receiver.recv() => {
+                match a {
+                    Some(p) => Ok(p),
+                    None => {
+                        Err(RaknetError::NotListen)
+                    },
                 }
+            },
+            _ = self.close_notifier.acquire() => {
+                raknet_log_debug!("accept close notified");
+                Err(RaknetError::NotListen)
             }
         }
     }
@@ -717,6 +737,35 @@ impl RaknetListener {
 
     pub fn guid(&self) -> u64 {
         self.guid
+    }
+
+    pub async fn recv_query(&mut self) -> Result<QueryPacket> {
+        if !self.listened {
+            return Err(RaknetError::NotListen);
+        }
+
+        tokio::select! {
+            packet = async { self.query_receiver.lock().await.recv().await } => {
+                match packet {
+                    Some(p) => Ok(p),
+                    None => {
+                        Err(RaknetError::NotListen)
+                    },
+                }
+            },
+            _ = self.close_notifier.acquire() => {
+                raknet_log_debug!("recv_query close notified");
+                Err(RaknetError::NotListen)
+            }
+        }
+    }
+
+    pub fn get_recv_query(&self) -> Result<Arc<Mutex<Receiver<QueryPacket>>>> {
+        if !self.listened {
+            return Err(RaknetError::NotListen);
+        }
+
+        Ok(self.query_receiver.clone())
     }
 
     async fn drop_watcher(&self) {
