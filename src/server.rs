@@ -323,14 +323,14 @@ impl RaknetListener {
 
                 match cur_status {
                     PacketID::UnconnectedPing1 => {
-                        let _ping = match read_packet_ping(&buf[..size]) {
+                        let ping = match read_packet_ping(&buf[..size]) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
                         let motd = { (*motd.read().await).clone() };
 
                         let packet = crate::packet::PacketUnconnectedPong {
-                            time: cur_timestamp_millis(),
+                            time: ping.time,
                             guid,
                             magic: true,
                             motd,
@@ -350,14 +350,14 @@ impl RaknetListener {
                         continue;
                     }
                     PacketID::UnconnectedPing2 => {
-                        match read_packet_ping(&buf[..size]) {
+                        let ping = match read_packet_ping(&buf[..size]) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
                         let motd = { (*motd.read().await).clone() };
 
                         let packet = crate::packet::PacketUnconnectedPong {
-                            time: cur_timestamp_millis(),
+                            time: ping.time,
                             guid,
                             magic: true,
                             motd,
