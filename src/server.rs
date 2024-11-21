@@ -309,7 +309,7 @@ impl RaknetListener {
                 // Check if it is Query Protocol.
                 if buf[0] == 0xFE && buf[1] == 0xFD {
                     raknet_log_debug!("received a Query Protocol packet");
-                    query_sender.send((addr, buf.to_vec())).await.ok();
+                    query_sender.send((addr, buf[..size].to_vec())).await.ok();
                     continue;
                 }
 
@@ -766,6 +766,10 @@ impl RaknetListener {
         }
 
         Ok(self.query_receiver.clone())
+    }
+
+    pub fn get_raw_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.socket.clone()
     }
 
     async fn drop_watcher(&self) {
