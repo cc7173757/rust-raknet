@@ -172,8 +172,8 @@ impl RaknetSocket {
         proxy_protocol_header: &Option<ProxyHeader<'a>>,
     ) -> tokio::io::Result<usize> {
         if enable_loss {
-            let mut rng = rand::thread_rng();
-            let i: u8 = rng.gen_range(0..11);
+            let mut rng = rand::rng();
+            let i: u8 = rng.random_range(0..11);
             if i > loss_rate {
                 raknet_log_debug!("loss packet");
                 return Ok(0);
@@ -214,7 +214,6 @@ impl RaknetSocket {
     ///    //do something
     /// }
     /// ```
-
     pub async fn connect(addr: &SocketAddr) -> Result<Self> {
         Self::connect_with_version(addr, RAKNET_PROTOCOL_VERSION).await
     }
