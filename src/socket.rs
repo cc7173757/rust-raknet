@@ -230,7 +230,11 @@ impl RaknetSocket {
     ) -> Result<Self> {
         let guid: u64 = rand::random();
 
-        let s = match UdpSocket::bind("0.0.0.0:0").await {
+        let s_bind_addr = match proxy_protocol_client_address {
+            Some(SocketAddr::V6(_)) => "[::]",
+            _ => "0.0.0.0",
+        };
+        let s = match UdpSocket::bind(format!("{s_bind_addr}:0")).await {
             Ok(p) => p,
             Err(_) => return Err(RaknetError::BindAddressError),
         };

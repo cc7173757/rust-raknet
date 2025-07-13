@@ -84,6 +84,7 @@ impl RaknetWriter {
         }
     }
 
+    #[allow(dead_code)]
     pub fn write_i32(&mut self, v: i32, n: Endian) -> Result<()> {
         match n {
             Endian::Big => {
@@ -141,7 +142,7 @@ impl RaknetWriter {
 
     pub fn write_address(&mut self, address: SocketAddr) -> Result<()> {
         if address.is_ipv4() {
-            self.write_u8(0x4)?;
+            self.write_u8(0x4)?; // Address version
             let ip_bytes = match address.ip() {
                 IpAddr::V4(ip) => ip.octets().to_vec(),
                 _ => vec![0; 4],
@@ -154,15 +155,16 @@ impl RaknetWriter {
             self.write_u16(address.port(), Endian::Big)?;
             Ok(())
         } else {
+            self.write_u8(0x6)?; // Address version
             self.write_i16(23, Endian::Little)?;
             self.write_u16(address.port(), Endian::Big)?;
-            self.write_i32(0, Endian::Big)?;
+            self.write_u32(0, Endian::Big)?;
             let ip_bytes = match address.ip() {
                 IpAddr::V6(ip) => ip.octets().to_vec(),
                 _ => vec![0; 16],
             };
             self.write(&ip_bytes)?;
-            self.write_i32(0, Endian::Big)?;
+            self.write_u32(0, Endian::Big)?;
             Ok(())
         }
     }
@@ -311,18 +313,18 @@ impl RaknetReader {
             let port = self.read_u16(Endian::Big)?;
             Ok(SocketAddr::new(IpAddr::V4(ip), port))
         } else {
-            if self.buf.remaining() < 44 {
+            if self.buf.remaining() < 28 {
                 return Err(RaknetError::ReadPacketBufferError);
             }
 
-            self.next(2);
+            self.next(2); // Address family
             let port = self.read_u16(Endian::Big)?;
-            self.next(4);
+            self.next(4); // Flow info
             let mut addr_buf = [0; 16];
             self.read(&mut addr_buf)?;
 
             let mut address_cursor = RaknetReader::new(addr_buf.to_vec());
-            self.next(4);
+            self.next(4); // Scope id
             Ok(SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(
                     address_cursor.read_u16(Endian::Big)?,
